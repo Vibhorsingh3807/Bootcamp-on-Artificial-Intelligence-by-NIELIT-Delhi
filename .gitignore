@@ -14,3 +14,11 @@ __pycache__/
 *.tif
 *.tiff
 221666051/221666051/*.tif
+
+# Large raw training image datasets (exceeds GitHub repository limits)
+DATASETS/
+DATASETS (2)/
+EchoSign/DATASETS/
+EchoSign/DATASETS (2)/
+*.zip
+*.tar*
