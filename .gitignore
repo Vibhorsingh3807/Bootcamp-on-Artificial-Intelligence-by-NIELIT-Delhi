@@ -1,0 +1,16 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache & Jupyter checkpoints
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Large satellite raster imagery (>100MB exceeds GitHub file size limits)
+*.tif
+*.tiff
+221666051/221666051/*.tif
