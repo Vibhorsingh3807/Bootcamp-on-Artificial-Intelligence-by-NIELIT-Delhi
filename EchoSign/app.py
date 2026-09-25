@@ -22,6 +22,7 @@ from EchoSign.nlp_engine import (
     text_to_signs, SIGN_DICTIONARY
 )
 from EchoSign.sign_engine import sign_recognizer, GESTURE_LABELS
+from EchoSign.asl_alphabet_engine import asl_classifier
 
 app = FastAPI(
     title="EchoSign AI - Assistive Communication Hub",
@@ -44,7 +45,8 @@ class LandmarksPayload(BaseModel):
     body_landmarks: Optional[Dict[str, Any]] = None
 
 class FramePayload(BaseModel):
-    image_base64: str
+    image_base64: Optional[str] = ""
+    landmarks: Optional[List[List[float]]] = None
 
 class NlpRefinePayload(BaseModel):
     signs: List[str]
@@ -107,7 +109,6 @@ def predict_landmarks(payload: LandmarksPayload):
         raw_pts = payload.landmarks
         if len(raw_pts) != 21:
             raise HTTPException(status_code=400, detail="Expected exactly 21 hand landmarks.")
-        # Single hand, dono haath, ya body-anchored gesture predict kar rahe hain
         result = sign_recognizer.predict(
             raw_pts, 
             secondary_landmarks=payload.secondary_landmarks,
@@ -117,45 +118,97 @@ def predict_landmarks(payload: LandmarksPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/predict_asl_landmarks")
+def predict_asl_landmarks(payload: LandmarksPayload):
+    """Ultra-low latency (<1ms) ASL alphabet prediction using 3D geometric hand landmarks."""
+    if not payload.landmarks or len(payload.landmarks) != 21:
+        raise HTTPException(status_code=400, detail="Expected exactly 21 hand landmarks.")
+    res = asl_classifier.predict(payload.landmarks)
+    return res
+
 @app.post("/api/predict_asl_image")
 def predict_asl_image(payload: FramePayload):
-    """Predicts ASL Alphabet letter using the trained deep CNN on RTX 4060 GPU."""
-    if asl_gpu_model is None:
-        raise HTTPException(status_code=503, detail="GPU Model not loaded yet.")
-    try:
-        # Decode base64 image
-        data_str = payload.image_base64
-        if "," in data_str:
-            data_str = data_str.split(",", 1)[1]
-        img_bytes = base64.b64decode(data_str)
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    """Predicts ASL Alphabet letter using RTX 4060 GPU CNN + 3D Landmark Geometric Engine."""
+    geom_res = None
+    if payload.landmarks and len(payload.landmarks) == 21:
+        try:
+            geom_res = asl_classifier.predict(payload.landmarks)
+        except Exception:
+            geom_res = None
 
-        tx = transforms.Compose([
-            transforms.Resize((128, 128)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        t_img = tx(img).unsqueeze(0).to(asl_device)
+    gpu_pred = None
+    gpu_conf = 0.0
+    top3_list = []
 
-        with torch.no_grad():
-            outputs = asl_gpu_model(t_img)
-            probs = torch.softmax(outputs, dim=1)[0]
-            top_prob, top_idx = torch.topk(probs, 3)
+    # If image is supplied and GPU model is loaded, run PyTorch inference
+    if payload.image_base64 and len(payload.image_base64) > 50 and asl_gpu_model is not None:
+        try:
+            data_str = payload.image_base64
+            if "," in data_str:
+                data_str = data_str.split(",", 1)[1]
+            img_bytes = base64.b64decode(data_str)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-        return {
-            "prediction": asl_classes[top_idx[0].item()],
-            "confidence": round(float(top_prob[0].item()), 4),
-            "top3": [
+            tx = transforms.Compose([
+                transforms.Resize((128, 128)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            t_img = tx(img).unsqueeze(0).to(asl_device)
+
+            with torch.no_grad():
+                outputs = asl_gpu_model(t_img)
+                probs = torch.softmax(outputs, dim=1)[0]
+                top_prob, top_idx = torch.topk(probs, 3)
+
+            gpu_pred = asl_classes[top_idx[0].item()]
+            gpu_conf = float(top_prob[0].item())
+            top3_list = [
                 {
                     "class": asl_classes[top_idx[i].item()],
                     "confidence": round(float(top_prob[i].item()), 4)
                 }
                 for i in range(len(top_idx))
-            ],
-            "device": str(asl_device)
+            ]
+        except Exception:
+            pass
+
+    # Hybrid Decision Fusion
+    if geom_res and geom_res.get("letter") and geom_res.get("letter") != "—":
+        final_letter = geom_res["letter"]
+        final_conf = geom_res.get("confidence", 0.95)
+
+        # Cross-validation with GPU CNN
+        if gpu_pred == final_letter:
+            final_conf = min(0.998, final_conf + 0.04)
+        elif gpu_pred and gpu_conf > 0.90 and gpu_pred in ["A", "S"] and final_letter in ["A", "S"]:
+            final_letter = gpu_pred
+            final_conf = gpu_conf
+
+        return {
+            "prediction": final_letter,
+            "confidence": round(float(final_conf), 4),
+            "top3": top3_list if top3_list else [{"class": final_letter, "confidence": round(float(final_conf), 4)}],
+            "device": str(asl_device),
+            "engine": "hybrid_geometric_gpu"
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    if gpu_pred:
+        return {
+            "prediction": gpu_pred,
+            "confidence": round(float(gpu_conf), 4),
+            "top3": top3_list,
+            "device": str(asl_device),
+            "engine": "rtx4060_gpu"
+        }
+
+    return {
+        "prediction": "—",
+        "confidence": 0.0,
+        "top3": [],
+        "device": str(asl_device),
+        "engine": "none"
+    }
 
 @app.get("/api/model_info")
 def get_model_info():

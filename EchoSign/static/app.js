@@ -397,6 +397,7 @@ function renderVisualSignStream(signs) {
 // --- Computer Vision & MediaPipe Hands Integration ---
 function initCamera() {
   const video = document.getElementById('webcamVideo');
+  state.videoElement = video;
   const canvas = document.getElementById('landmarkCanvas');
   const ctx = canvas.getContext('2d');
   const btnToggleCam = document.getElementById('btnToggleCam');
@@ -697,7 +698,8 @@ function onHandsResults(results, canvas, ctx, bodyAnchors = null) {
     }
 
     if (state.recognitionMode === 'alphabet') {
-      sendFrameToAslGpu(video, raw1);
+      const activeVideo = state.videoElement || document.getElementById('webcamVideo');
+      sendFrameToAslGpu(activeVideo, raw1);
     } else {
       const formatted1 = raw1.map(p => [p.x, p.y, p.z || 0.0]);
       const formatted2 = raw2 ? raw2.map(p => [p.x, p.y, p.z || 0.0]) : null;
@@ -705,6 +707,9 @@ function onHandsResults(results, canvas, ctx, bodyAnchors = null) {
     }
   } else {
     state.isHandPresent = false;
+    state.lastAddedSign = null;
+    state.candidateSign = null;
+    state.consecutiveFrames = 0;
     handStateBadge.textContent = 'Searching Hand...';
     handStateBadge.classList.remove('active');
     updateSpotlight('—', 0.0);
@@ -764,29 +769,38 @@ async function sendFrameToAslGpu(video, rawLandmarks) {
   isPredictingGpu = true;
 
   try {
-    const vw = video.videoWidth || 640;
-    const vh = video.videoHeight || 480;
+    const formattedLandmarks = rawLandmarks.map(p => [p.x, p.y, p.z || 0.0]);
+    let b64 = "";
 
-    let minX = Math.min(...rawLandmarks.map(p => p.x));
-    let maxX = Math.max(...rawLandmarks.map(p => p.x));
-    let minY = Math.min(...rawLandmarks.map(p => p.y));
-    let maxY = Math.max(...rawLandmarks.map(p => p.y));
+    const activeVideo = video || state.videoElement || document.getElementById('webcamVideo');
+    if (activeVideo && activeVideo.readyState >= 2) {
+      const vw = activeVideo.videoWidth || 640;
+      const vh = activeVideo.videoHeight || 480;
 
-    const pad = 0.08;
-    minX = Math.max(0, minX - pad) * vw;
-    maxX = Math.min(1, maxX + pad) * vw;
-    minY = Math.max(0, minY - pad) * vh;
-    maxY = Math.min(1, maxY + pad) * vh;
-    const boxW = Math.max(10, maxX - minX);
-    const boxH = Math.max(10, maxY - minY);
+      let minX = Math.min(...rawLandmarks.map(p => p.x));
+      let maxX = Math.max(...rawLandmarks.map(p => p.x));
+      let minY = Math.min(...rawLandmarks.map(p => p.y));
+      let maxY = Math.max(...rawLandmarks.map(p => p.y));
 
-    offCtx.drawImage(video, minX, minY, boxW, boxH, 0, 0, 128, 128);
-    const b64 = offscreenCanvas.toDataURL('image/jpeg', 0.85);
+      const pad = 0.08;
+      minX = Math.max(0, minX - pad) * vw;
+      maxX = Math.min(1, maxX + pad) * vw;
+      minY = Math.max(0, minY - pad) * vh;
+      maxY = Math.min(1, maxY + pad) * vh;
+      const boxW = Math.max(10, maxX - minX);
+      const boxH = Math.max(10, maxY - minY);
+
+      offCtx.drawImage(activeVideo, minX, minY, boxW, boxH, 0, 0, 128, 128);
+      b64 = offscreenCanvas.toDataURL('image/jpeg', 0.85);
+    }
 
     const resp = await fetch('/api/predict_asl_image', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_base64: b64 })
+      body: JSON.stringify({
+        image_base64: b64,
+        landmarks: formattedLandmarks
+      })
     });
     const data = await resp.json();
 
@@ -800,7 +814,7 @@ async function sendFrameToAslGpu(video, rawLandmarks) {
       updatePracticeScore(letter, conf);
     }
   } catch (err) {
-    console.error('Error in GPU prediction:', err);
+    console.error('Error in ASL Alphabet prediction:', err);
   } finally {
     isPredictingGpu = false;
   }
@@ -858,22 +872,63 @@ function updateSpotlight(gestureName, confidence) {
 
 // De-jittered sign buffer logic: requires sustained detection before registering
 function processGestureStream(gesture, confidence) {
-  if (gesture === 'NO_HAND' || confidence < 0.7) {
+  if (!gesture || gesture === 'NO_HAND' || gesture === 'nothing' || gesture === '—' || confidence < 0.60) {
     state.consecutiveFrames = 0;
     return;
   }
 
-  if (gesture === state.candidateSign) {
+  // Handle DEL / Backspace token
+  if (gesture.toLowerCase() === 'del' || gesture.toLowerCase() === 'delete') {
+    if (state.candidateSign === gesture) {
+      state.consecutiveFrames++;
+      if (state.consecutiveFrames === 3) {
+        if (state.activeSignBuffer.length > 0) {
+          state.activeSignBuffer.pop();
+          state.lastAddedSign = null;
+          renderSignChips();
+          synthesizeSentence();
+        }
+      }
+    } else {
+      state.candidateSign = gesture;
+      state.consecutiveFrames = 1;
+    }
+    return;
+  }
+
+  // Handle SPACE token
+  if (gesture.toLowerCase() === 'space') {
+    if (state.candidateSign === gesture) {
+      state.consecutiveFrames++;
+      if (state.consecutiveFrames === 3) {
+        if (state.lastAddedSign !== ' ') {
+          addSignToBuffer(' ');
+          state.lastAddedSign = ' ';
+        }
+      }
+    } else {
+      state.candidateSign = gesture;
+      state.consecutiveFrames = 1;
+    }
+    return;
+  }
+
+  let cleanGesture = gesture;
+  if (cleanGesture.startsWith('Letter: ')) {
+    cleanGesture = cleanGesture.replace('Letter: ', '').trim();
+  }
+
+  if (cleanGesture === state.candidateSign) {
     state.consecutiveFrames++;
-    // If held stable for 5 frames (~350ms)
-    if (state.consecutiveFrames === 5) {
-      if (state.lastAddedSign !== gesture) {
-        addSignToBuffer(gesture);
-        state.lastAddedSign = gesture;
+    // If held stable for 3 frames (~200ms)
+    if (state.consecutiveFrames === 3) {
+      if (state.lastAddedSign !== cleanGesture) {
+        addSignToBuffer(cleanGesture);
+        state.lastAddedSign = cleanGesture;
       }
     }
   } else {
-    state.candidateSign = gesture;
+    state.candidateSign = cleanGesture;
     state.consecutiveFrames = 1;
   }
 }
@@ -888,7 +943,7 @@ function addSignToBuffer(signName) {
 function renderSignChips() {
   const container = document.getElementById('signChipsContainer');
   if (state.activeSignBuffer.length === 0) {
-    container.innerHTML = `<span class="placeholder-chip">Perform gestures to build sentence...</span>`;
+    container.innerHTML = `<span class="placeholder-chip">Perform gestures or fingerspell to build sentence...</span>`;
     return;
   }
 
@@ -896,7 +951,8 @@ function renderSignChips() {
   state.activeSignBuffer.forEach((sign, idx) => {
     const chip = document.createElement('span');
     chip.className = 'sign-chip';
-    chip.innerHTML = `${sign} <span style="cursor: pointer; opacity: 0.6; margin-left: 4px;" onclick="removeSignChip(${idx})">&times;</span>`;
+    const displaySign = sign === ' ' ? '␣ SPACE' : sign;
+    chip.innerHTML = `${displaySign} <span style="cursor: pointer; opacity: 0.6; margin-left: 4px;" onclick="removeSignChip(${idx})">&times;</span>`;
     container.appendChild(chip);
   });
 }
@@ -946,7 +1002,12 @@ async function synthesizeSentence() {
 
     // Speak out loud if Auto-Speak is enabled
     if (state.autoSpeak && data.sentence) {
-      speakText(data.sentence);
+      let speechText = data.sentence;
+      // If it's a fingerspelled name, speak the clean name directly
+      if (speechText.includes("Fingerspelled Name: ")) {
+        speechText = speechText.replace("Fingerspelled Name: ", "").replace("!", "").trim();
+      }
+      speakText(speechText);
     }
   } catch (err) {
     console.error('Error synthesizing sentence:', err);

@@ -172,7 +172,60 @@ def reconstruct_sentence_from_signs(sign_tokens):
     """Raw detected signs ko jodkar smooth, respectful English sentence banana."""
     if not sign_tokens:
         return "No signs detected yet."
-    
+
+    # -------------------------------------------------------------
+    # 1. Fingerspelling & Letter Sequence Assembly (A-Z, space, del)
+    # -------------------------------------------------------------
+    # Process control tokens: 'nothing' (skip), 'del' (backspace), 'space'
+    processed_letters = []
+    for raw_s in sign_tokens:
+        s_str = str(raw_s)
+        if s_str == " " or s_str == "_":
+            if processed_letters and processed_letters[-1] != " ":
+                processed_letters.append(" ")
+            continue
+
+        token = s_str.strip().upper()
+        if token in ["NOTHING", "", "NONE", "NO_HAND"]:
+            continue
+        elif token in ["DEL", "DELETE", "BACKSPACE"]:
+            if processed_letters:
+                processed_letters.pop()
+        elif token in ["SPACE"]:
+            if processed_letters and processed_letters[-1] != " ":
+                processed_letters.append(" ")
+        else:
+            if token.startswith("LETTER:"):
+                token = token.replace("LETTER:", "").strip()
+            processed_letters.append(token)
+
+    # If tokens are predominantly single alphabet letters
+    single_letters = [t for t in processed_letters if len(t) == 1 and t.isalpha()]
+    if single_letters and (len(single_letters) >= len(processed_letters) * 0.45 or len(single_letters) >= 2):
+        words = []
+        cur_word = []
+        for t in processed_letters:
+            if t == " ":
+                if cur_word:
+                    words.append("".join(cur_word))
+                    cur_word = []
+            elif len(t) == 1 and t.isalpha():
+                cur_word.append(t)
+            else:
+                if cur_word:
+                    words.append("".join(cur_word))
+                    cur_word = []
+                words.append(t)
+        if cur_word:
+            words.append("".join(cur_word))
+
+        if words:
+            formatted = " ".join([w.capitalize() for w in words])
+            return f"Fingerspelling: {formatted}"
+
+    # -------------------------------------------------------------
+    # 2. Conversational Words Mode (Namaste, Please, Water, Doctor...)
+    # -------------------------------------------------------------
     clean_signs = []
     for s in sign_tokens:
         s_upper = s.strip().upper()
